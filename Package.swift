@@ -24,8 +24,8 @@ let package = Package(
         // Binary XCFramework
         .binaryTarget(
             name: "DoorbellSDK",
-            url: "https://github.com/CharanBlaze/DoorbellSDK/releases/download/1.0.0/DoorbellSDK.zip",
-            checksum: "f8ca0d3c8971bbfaf6a927713677d68f2f1d4db7102b3f1af1f5dcba0235ed2d"
+            url: "https://github.com/CharanBlaze/DoorbellSDK/releases/download/1.0.1/DoorbellSDK.zip",
+            checksum: "52b51faa2833fe523e9219bdb2f7d5428f2f81f28a4957398a6fa6d8006dd978"
         ),
 
         // Wrapper target to expose dependencies
