@@ -22,7 +22,7 @@ let package = Package(
     targets: [
 
         .binaryTarget(
-            name: "DoorbellSDKBinary",
+            name: "DoorbellSDK",
             url: "https://github.com/CharanBlaze/DoorbellSDK/releases/download/1.0.3/DoorbellSDK_1_0_3.zip",
             checksum: "9f06ebb9bbd4c56ffcfcd3972e9100af3b2d439f76035f585d0f3dfe33184dc2"
         ),
@@ -30,7 +30,7 @@ let package = Package(
         .target(
             name: "DoorbellSDKWrapper",
             dependencies: [
-                "DoorbellSDKBinary",
+                "DoorbellSDK",
                 .product(name: "WebRTC", package: "WebRTC")
             ]
         )
