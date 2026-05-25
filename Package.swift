@@ -21,18 +21,16 @@ let package = Package(
     ],
     targets: [
 
-        // Binary XCFramework
         .binaryTarget(
-            name: "DoorbellSDK",
-            url: "https://github.com/CharanBlaze/DoorbellSDK/releases/download/1.0.2/DoorbellSDK_1_0_2.zip",
-            checksum: "af0960e5a41f777a47822d8eb5ff9561733b686869642926b104fd450acb417b"
+            name: "DoorbellSDKBinary",
+            url: "https://github.com/CharanBlaze/DoorbellSDK/releases/download/1.0.3/DoorbellSDK_1_0_3.zip",
+            checksum: "9f06ebb9bbd4c56ffcfcd3972e9100af3b2d439f76035f585d0f3dfe33184dc2"
         ),
 
-        // Wrapper target to expose dependencies
         .target(
             name: "DoorbellSDKWrapper",
             dependencies: [
-                "DoorbellSDK",
+                "DoorbellSDKBinary",
                 .product(name: "WebRTC", package: "WebRTC")
             ]
         )
