@@ -21,8 +21,8 @@ let package = Package(
     targets: [
         .binaryTarget(
             name: "DoorbellSDK",
-            url: "https://github.com/CharanBlaze/DoorbellSDK/releases/download/1.0.15/DoorbellSDK_1_0_15.zip",
-            checksum: "460e6c74f462cc0844000b1bfebdddaf33423826f2755a6405e7c008b94c322f"
+            url: "https://github.com/CharanBlaze/DoorbellSDK/releases/download/1.0.17/DoorbellSDK_1_0_17.zip",
+            checksum: "950d602dca8e72d91fc00dad862dafb51d517389facecdc19f9e07cbd5cb27b5"
         ),
         .target(
             name: "DoorbellSDKWrapper",
