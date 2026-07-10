@@ -14,15 +14,15 @@ let package = Package(
     ],
     dependencies: [
         .package(
-            url: "https://github.com/stasel/WebRTC.git",
-            from: "147.0.0"
+            url: "https://github.com/livekit/webrtc-xcframework.git",
+            from: "144.7559.11"
         )
     ],
     targets: [
         .binaryTarget(
             name: "DoorbellSDK",
-            url: "https://github.com/CharanBlaze/DoorbellSDK/releases/download/1.0.19/DoorbellSDK_1_0_19.zip",
-            checksum: "5a5c126ad1d61ecf90089a65672d6e2eb0b13a40a882c1557d6eb8d57882c704"
+            url: "https://github.com/CharanBlaze/DoorbellSDK/releases/download/1.0.21/DoorbellSDK_1_0_21.zip",
+            checksum: "ce7208af46092f8dd6f79ae7ae40b01a680b12343cd4bb4a4954d48f1d515f36"
         ),
         .target(
             name: "DoorbellSDKWrapper",
