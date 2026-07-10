@@ -27,8 +27,8 @@ let package = Package(
         .target(
             name: "DoorbellSDKWrapper",
             dependencies: [
-                "DoorbellSDK", 
-                .product(name: "WebRTC", package: "WebRTC")
+                "DoorbellSDK",
+                .product(name: "LiveKitWebRTC", package: "webrtc-xcframework")
             ],
             path: "Sources/DoorbellSDKWrapper"
         )
