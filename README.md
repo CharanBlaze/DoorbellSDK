@@ -1,284 +1,151 @@
-# DoorbellSDK — iOS Integration Guide
+# DoorbellSDK
 
-**Version 1.1.0 · Swift Package · AWS Kinesis Video Streams (KVS) WebRTC**
-
-A lightweight Swift SDK for live video-doorbell streaming. It handles everything
-between AWS credentials and a live picture on screen: signaling, ICE/DTLS,
-**H.265** hardware video decode, and two-way audio (**Talk / Listen**) with
-hardware echo cancellation. You give it credentials and a `UIView`; it gives you
+A Swift SDK for live video-doorbell streaming over **AWS Kinesis Video Streams
+(KVS) WebRTC**. It handles signaling, ICE/DTLS, H.265 video decoding and
+rendering, and two-way audio (Talk / Listen) with hardware echo cancellation and
+automatic loudspeaker routing — you give it credentials and a view, it gives you
 a live stream.
 
-Its headline feature is a **two-phase connect** engineered for calls: **pre-warm**
-the connection the instant a call comes in (while the phone is still ringing),
-then **accept** to go live the moment the user answers — so answering feels
-*instant* instead of connecting from scratch.
+Everything media-related lives inside the SDK. Your app never touches WebRTC,
+audio sessions, decoders, or routing — the entire integration is the
+`DoorbellSDKClient` API described below.
 
-> **Read this first if you only read one section:** [§4 — The performance model
-> (prewarm & two-phase connect)](#4-the-performance-model--prewarm--two-phase-connect).
-> It is the whole reason this SDK exists and is where all the speed comes from.
+There are two ways to use it:
 
----
-
-## Table of contents
-
-1. [Requirements](#1-requirements)
-2. [Installation (Swift Package Manager)](#2-installation-swift-package-manager)
-3. [Info.plist keys](#3-infoplist-keys)
-4. [The performance model — prewarm & two-phase connect](#4-the-performance-model--prewarm--two-phase-connect) ⭐
-6. [Full CallKit integration (recommended)](#6-full-callkit-integration-recommended)
-7. [Audio controls (Talk / Listen)](#7-audio-controls-talk--listen)
-9. [Teardown](#9-teardown)
-10. [Credentials](#10-credentials)
-11. [Events & errors](#11-events--errors)
-12. [State flags](#12-state-flags)
-13. [How a connection is built (internals)](#13-how-a-connection-is-built-internals)
-14. [Resilience — how the SDK survives a flaky network](#14-resilience--how-the-sdk-survives-a-flaky-network)
-15. [Full API reference](#15-full-api-reference)
-16. [Threading rules](#16-threading-rules)
-17. [Integration checklist & troubleshooting](#17-integration-checklist--troubleshooting)
+| Flow | Use when | Entry point |
+| --- | --- | --- |
+| **A. CallKit call flow** | The doorbell *rings* the phone and the user answers a call | `prepareConnection` → `acceptCall` |
+| **B. Direct live view** | The user opens a "View Live" screen from inside your app | `connectToStream` |
 
 ---
 
-## 1. Requirements
+## Requirements
 
-| | |
-| --- | --- |
-| **iOS** | 14.0 or later |
-| **Swift** | 5.7+ (Xcode 14+) |
-| **Backend** | A KVS signaling channel + AWS credentials scoped to it (see [§10](#10-credentials)) |
-| **Video codec** | The doorbell streams **H.265 (HEVC)**. All 64-bit iPhones/iPads since the iPhone 7 (A10, iOS 11+) decode HEVC in hardware, so every iOS 14 device is covered. |
+- iOS 13.0+
+- Swift 5.9+
+- A KVS signaling channel + temporary AWS credentials (see [Credentials](#credentials))
 
-The single public class you interact with is **`DoorbellSDKClient`** (a shared
-singleton). Everything else in the package is internal.
+## Installation (Swift Package Manager)
 
----
-
-## 2. Installation (Swift Package Manager)
-
-In Xcode: **File ▸ Add Package Dependencies…**, paste the package URL, and add
-the **DoorbellSDK** product to your app target. Or, in your own `Package.swift`:
+In Xcode: **File ▸ Add Package Dependencies…** and enter the package URL, or add
+it to your `Package.swift`:
 
 ```swift
 dependencies: [
-    .package(url: "https://your-git-host/DoorbellSDK.git", from: "1.0.2")
+    .package(url: "https://github.com/CharanBlaze/DoorbellSDK.git", from: "1.0.2")
 ]
 ```
 
-Then import it wherever you use it:
+The SDK depends on **LiveKitWebRTC** (a WebRTC binary), which SPM resolves
+automatically.
+
+## Info.plist keys
+
+| Key | Why |
+| --- | --- |
+| `NSMicrophoneUsageDescription` | Required. Used by **Talk**, and by the audio engine while **Listen** is on (see [Audio behavior](#audio-behavior)). |
+| `NSLocalNetworkUsageDescription` | Required if the doorbell and phone can reach each other directly on the LAN (iOS 14+ local-network privacy). |
+| `UIBackgroundModes` → `audio`, `voip` | Required for the CallKit flow (VoIP push + audio continuing in background). |
+
+## Microphone permission
+
+Request record permission **before** the user first enables Talk or Listen —
+for example when your live/call screen appears:
 
 ```swift
-import DoorbellSDK
+AVAudioSession.sharedInstance().requestRecordPermission { granted in
+    // Update your Talk button state accordingly.
+}
 ```
 
-> **One transitive dependency.** The SDK depends on **LiveKitWebRTC** (a
-> pre-built WebRTC binary xcframework, `webrtc-xcframework` ≥ `144.7559.11`).
-> SPM resolves and links it automatically — you do **not** add it yourself, and
-> you do **not** need the AWS SDK for Swift. All AWS signing (SigV4) is done
-> inside DoorbellSDK with `URLSession` + `CommonCrypto`, so the footprint stays
-> small.
+Talk cannot work without it, and Listen uses the audio engine's capture path
+(muted) for correct loudspeaker routing, so grant it up front for the best
+experience.
 
----
+## Initialize at launch
 
-## 3. Info.plist keys
-
-| Key | Why you need it |
-| --- | --- |
-| `NSMicrophoneUsageDescription` | Required for **Talk** (sending mic audio). Without it, the mic/audio path fails silently. |
-| `NSLocalNetworkUsageDescription` | Required when the doorbell and phone can reach each other directly on the same Wi-Fi (iOS 14+ local-network privacy). This is what enables the fast **LAN-direct** path — see [§4](#4-the-performance-model--prewarm--two-phase-connect). |
-| `UIBackgroundModes` → `audio`, `voip` | Only if the call / talkback must keep running when the app is backgrounded. **Recommended for CallKit.** |
-
----
-
-## 4. The performance model — prewarm & two-phase connect
-
-This is the core of the SDK. A cold WebRTC connect to KVS is slow — it is several
-serial network round-trips plus a one-time SSL initialization. If you wait until
-the user taps **Answer** to start all of that, the user stares at a black screen
-for a second or more. DoorbellSDK's job is to make that time *disappear* by doing
-the slow work **before** the user answers, and by **reusing** everything that can
-safely be reused.
-
-There are five independent optimizations. They stack.
-
-### 4.1 — `prewarm()` at app launch (saves ~150 ms, once)
-
-The very first WebRTC connection in a process pays a one-time cost to initialize
-BoringSSL and build the peer-connection factory (~150 ms). Pay it at launch,
-off the critical path, so the first real connect never sees it:
+Call once at app launch. It pre-initializes WebRTC (SSL, codec factories) and
+removes ~150 ms from the first connection:
 
 ```swift
-import DoorbellSDK
-
 func application(_ application: UIApplication,
-                 didFinishLaunchingWithOptions launchOptions: [...]?) -> Bool {
-    DoorbellSDKClient.prewarm()      // initializes SSL + logs codec capability
+                 didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]?) -> Bool {
+    DoorbellSDKClient.prewarm()
     return true
 }
 ```
 
-What it does under the hood:
-
-- Calls `LKRTCInitializeSSL()` **exactly once** and remembers it — SSL then
-  stays initialized for the entire process lifetime. It is deliberately **not**
-  torn down when a stream stops, so every subsequent connect and reconnect
-  reuses it for free.
-- Logs the device's codec capability once, so you can confirm in the console
-  that **H.265 decode is supported** on the build/device.
-
-`prewarm()` is safe to call multiple times (subsequent calls are no-ops) and is
-cheap. Call it once at launch.
-
-### 4.2 — Two-phase connect: `prepareConnection()` → `acceptCall()` (hides the *entire* connect behind the ring)
-
-This is the big one. Instead of one blocking "connect" call, the connect is split
-into a **warm-up phase** and a **go-live phase**:
-
-**Phase 1 — `prepareConnection(...)`** — call this the instant a call is
-signalled (from your PushKit/VoIP handler, or when the ringing screen appears).
-It runs **every slow step** of the connection:
-
-- fetches (or reuses) the KVS signaling endpoints,
-- fetches the TURN/ICE servers and signs the WebSocket URL **in parallel**,
-- opens the signaling WebSocket,
-- creates the peer connection and **starts local ICE candidate gathering**,
-
-…but it deliberately **holds back the SDP offer**. Because the offer is never
-sent, the doorbell never answers, so **no audio or video flows** and — critically
-— **the audio session is left completely untouched**: the user's music keeps
-playing and no microphone indicator lights up while the phone is merely ringing.
-
-You receive `.connected` when the socket opens, then `.prepared` when warm-up is
-complete and the offer is armed and waiting.
-
-**Phase 2 — `acceptCall()`** — the user tapped Answer. This releases the
-pre-armed offer, the handshake completes against an already-open socket with ICE
-already gathered, and media goes live almost immediately. You then receive
-`.streamStarted` and `.firstFrameReceived`.
-
-**Phase 2 (alternative) — `declineCall()`** — the user declined or the call
-timed out. Full teardown, everything released.
-
-```
-  Call rings          User answers
-      │                    │
-      ▼                    ▼
-  prepareConnection()  acceptCall()
-      │                    │
-      ├─ fetch endpoints   └─ release the held offer ──▶ answer ──▶ media LIVE
-      ├─ fetch ICE + sign WSS   (socket already open, ICE already gathered)
-      ├─ open WebSocket
-      ├─ gather ICE
-      └─ ARM offer (hold) ──▶ .prepared
-```
-
-> **A fast "Answer" tap is never lost.** `acceptCall()` is safe to call **even
-> before `.prepared` arrives**. If the socket is still connecting, the SDK
-> remembers the accept and sends the offer the moment the socket opens. It is
-> even safe to call `acceptCall()` *before* `prepareConnection()` has finished
-> fetching credentials in the background — the accept is remembered and applied
-> automatically when warm-up completes.
-
-> **Keep the pre-warm window short.** ICE / TURN allocations go stale after a few
-> minutes. If a call is never answered, call `declineCall()` (e.g. on your
-> ring-timeout) so nothing lingers.
-
-### 4.3 — Endpoint cache (saves ~396 ms on every reconnect)
-
-The first step of any KVS connect is `GetSignalingChannelEndpoint`, a ~396 ms
-round-trip that returns the channel's WSS + HTTPS endpoints. Those endpoints are
-**stable** for the life of the channel (they only change if the channel is
-deleted and recreated), so the SDK caches them **process-wide**, keyed by
-`channelARN + role + region`, with a 5-minute TTL.
-
-The result: the **second and subsequent** connects to the same channel — a
-reconnect after a network blip, re-opening the live view, the next call within
-five minutes — **skip the endpoint round-trip entirely**.
-
-This is done safely:
-
-- Only the **stable, non-secret** endpoints are cached. The channel ARN already
-  scopes them to your account.
-- Everything that actually **expires is always fetched fresh** on every connect:
-  the SigV4-signed WSS URL and the TURN credentials. Nothing that can go stale is
-  ever reused.
-- The cache **self-heals**: any startup or pre-connect failure invalidates the
-  entry (in case the channel was recreated), and every entry expires after 5
-  minutes regardless.
-
-### 4.4 — Parallel fetch + pre-armed offer (collapses serial round-trips)
-
-Inside warm-up, the two independent network operations — **fetching the ICE/TURN
-servers** and **signing the WebSocket URL** — run **concurrently** rather than
-one after the other.
-
-At the same time, the SDK **pre-arms the SDP offer**: it creates the offer and
-sets the local description *while the WebSocket is still connecting*, which kicks
-off **local ICE candidate gathering in parallel** with the handshake. A
-pre-gathered ICE candidate pool (`iceCandidatePoolSize = 10`) means candidates
-are ready and waiting rather than being gathered on demand. By the time the
-socket is open and the user has answered, ICE is already well underway.
-
-### 4.5 — Smart ICE candidate delivery + LAN-direct path (shaves seconds off "checking")
-
-Two more optimizations get the first frame on screen sooner:
-
-- **Prioritized candidate delivery.** Local ICE candidates are sent over the
-  signaling channel through a small throttle queue that **pushes RELAY and UDP
-  candidates to the front of the line**. The winning path is therefore offered to
-  the doorbell first. A 10 ms spacing between sends prevents the doorbell's
-  IoT-grade WebSocket buffer from overflowing, while still beating the doorbell's
-  internal candidate timer.
-
-- **LAN-direct when possible.** The ICE transport policy is `.all`, which allows
-  host (LAN) candidates. When the phone and doorbell are on the **same Wi-Fi**,
-  WebRTC can nominate a **direct sub-10 ms path** instead of relaying every packet
-  through an AWS TURN server — lower latency and lower AWS cost. It transparently
-  falls back to STUN/TURN on networks that require it, so there is no regression
-  on cellular or segmented networks. *(This is why `NSLocalNetworkUsageDescription`
-  matters — see [§3](#3-infoplist-keys).)*
-
-### 4.6 — Putting it together
-
-| Stage | Cold, naïve connect | With DoorbellSDK |
-| --- | --- | --- |
-| SSL init (~150 ms) | On first connect, blocking | Paid at launch via `prewarm()` |
-| `GetSignalingChannelEndpoint` (~396 ms) | Every connect | Skipped on reconnect (endpoint cache) |
-| ICE fetch + WSS signing | Serial | **Parallel** |
-| ICE gathering | After socket opens | **Started during** warm-up (pre-armed offer) |
-| Endpoint→answer round-trips | All happen *after* the user taps Answer | All happen *while the phone rings* |
-| Perceived time to first frame after "Answer" | Full cold connect | ≈ one SDP answer + ICE nomination |
-
-The user experience: **the connect happens during the ring, and answering just
-lifts a curtain on a stream that is already there.**
-
 ---
 
-## 6. Full CallKit integration (recommended)
+# Flow A — CallKit call flow (doorbell rings the phone)
 
-This is the intended production flow for an incoming-doorbell **call**. It wires
-the two-phase connect into CallKit so answering is instant.
+The SDK is built around a **two-phase connect** so answering feels instant:
 
-### 6.1 — The stable render container
+1. **`prepareConnection(...)`** — call the instant the call is signalled (from
+   your VoIP push handler, when you report the call to CallKit). It performs
+   every slow step — credential/ICE fetch, signaling WebSocket connect, local
+   ICE gathering — but **holds the SDP offer**, so no media flows and the audio
+   session is untouched (the user's music keeps playing, no mic indicator).
+   You receive `.connected`, then `.prepared`.
 
-`prepareConnection(renderIn:)` needs a `UIView` to render into — but your call
-screen may not exist yet at pre-warm time. The pattern: keep **one stable
-container view** alive for the whole call, pre-warm into it, then re-parent it
-into the call screen when the user answers. That way the frame is visible whether
-pre-warm finished before or after the screen appeared.
+2. **`acceptCall()`** — the user answered. Releases the held offer, the
+   handshake completes, and you receive `.streamStarted` then
+   `.firstFrameReceived`.
 
-```swift
-/// A container the SDK renders into for the whole call. Created up front and
-/// re-parented into the call screen on accept.
-let videoContainer = UIView()
-```
+3. **`declineCall()`** — the user declined or the ring timed out. Full teardown.
 
-### 6.2 — The `CXProviderDelegate`
+> `acceptCall()` is safe to call **at any moment** — before `.prepared`, even
+> before `prepareConnection` has run (e.g. credentials still loading). The SDK
+> remembers the accept and applies it as soon as it can, so a fast "Answer" tap
+> is never lost.
+
+> Keep the pre-warm window short. ICE/TURN allocations go stale after a few
+> minutes — if the call is never answered, call `declineCall()` on your ring
+> timeout.
+
+### Step-by-step
+
+| When | Call |
+| --- | --- |
+| Incoming VoIP push → after `reportNewIncomingCall` | `prepareConnection(credentials:renderIn:onEvent:)` |
+| `CXAnswerCallAction` | `setCallKitSessionOwnership(owned: true)` → `action.fulfill()` → `acceptCall()` → present your call screen |
+| `provider(_:didActivate:)` | `startAudio()` |
+| `.streamStarted` event | `setListen(enabled: true)` (recommended — visitor audible immediately) |
+| User taps Talk | `setTalk(enabled: true/false)` |
+| `CXEndCallAction`, call was **never accepted** | `setCallKitSessionOwnership(owned: false)` → `declineCall()` |
+| Call screen dismissed after an accepted call | `disconnect()` |
+| `provider(_:didDeactivate:)` | `stopAudio()` |
+| `providerDidReset` | `setCallKitSessionOwnership(owned: false)` |
+
+Three rules make CallKit audio reliable:
+
+1. **Tell the SDK CallKit owns the audio session** with
+   `setCallKitSessionOwnership(owned: true)` in `CXAnswerCallAction`, *before
+   any media negotiates*. The SDK then primes the audio session category for
+   you and waits for CallKit to activate the session — **do not call
+   `AVAudioSession.setCategory` / `setActive` yourself anywhere in the call
+   flow.**
+2. **Forward CallKit's audio activation** with `startAudio()` /
+   `stopAudio()` from `didActivate` / `didDeactivate`. `startAudio()` is safe
+   even if the stream isn't connected yet — the SDK defers it internally and
+   starts audio when the stream comes up.
+3. **Release ownership on every exit path** — declined call, `didDeactivate`
+   (via `stopAudio()`), and `providerDidReset`.
+
+### Rendering during pre-warm
+
+`prepareConnection(renderIn:)` needs a `UIView`, but your call screen doesn't
+exist while the phone is still ringing. Keep a **stable container view** alive
+for the whole call: pre-warm into it, then re-parent it into your call screen
+when the user answers. Video is rendered into it whether the first frame
+arrives before or after the screen appears.
+
+### Full CallKit example
 
 ```swift
 import CallKit
-import AVFoundation
 import UIKit
-import DoorbellSDK
+// import DoorbellSDK
 
 final class CallController: NSObject, CXProviderDelegate {
 
@@ -288,8 +155,12 @@ final class CallController: NSObject, CXProviderDelegate {
     private var currentCallID: UUID?
     private var didAccept = false
 
-    /// Stable render target for the whole call (see §6.1).
+    /// Stable render target for the whole call (see note above).
     let videoContainer = UIView()
+
+    /// Re-broadcast SDK events so your call screen can subscribe without
+    /// re-registering the SDK's single event handler mid-call.
+    var onStreamEvent: ((DoorbellEvent) -> Void)?
 
     override init() {
         let config = CXProviderConfiguration()
@@ -300,9 +171,7 @@ final class CallController: NSObject, CXProviderDelegate {
         provider.setDelegate(self, queue: nil)
     }
 
-    // ── Incoming call ──────────────────────────────────────────────
-    // Call from your VoIP / PushKit handler. Report to CallKit, then
-    // PRE-WARM immediately so answering is instant.
+    // ── 1. Incoming call: report to CallKit, then PRE-WARM immediately ──
     func reportIncomingCall(named name: String) {
         let id = UUID()
         currentCallID = id
@@ -314,7 +183,7 @@ final class CallController: NSObject, CXProviderDelegate {
 
         provider.reportNewIncomingCall(with: id, update: update) { [weak self] error in
             guard error == nil else { return }
-            self?.prewarm()                       // ← Phase 1 starts while ringing
+            self?.prewarm()
         }
     }
 
@@ -322,67 +191,67 @@ final class CallController: NSObject, CXProviderDelegate {
         // Fetch your KVS credentials however you like (your backend, Cognito…).
         fetchDoorbellCredentials { [weak self] credentials in
             guard let self, let credentials else { return }
+            self.videoContainer.subviews.forEach { $0.removeFromSuperview() }
             DoorbellSDKClient.shared.prepareConnection(
                 credentials: credentials,
                 renderIn: self.videoContainer
-            ) { event in
-                switch event {
-                case .connected:          print("Signaling connected")
-                case .prepared:           print("Warm-up complete — ready to accept")
-                case .streamStarted:      print("Media live")
-                case .firstFrameReceived: print("Video rendering")
-                case .error(let e):       print("SDK error: \(e.message)")
-                default: break
+            ) { [weak self] event in
+                if case .streamStarted = event {
+                    // Visitor audible the moment media flows — no extra tap.
+                    DoorbellSDKClient.shared.setListen(enabled: true)
                 }
+                self?.onStreamEvent?(event)
             }
         }
     }
 
-    // ── User answered ──────────────────────────────────────────────
+    // ── 2. User answered ─────────────────────────────────────────────
     func provider(_ provider: CXProvider, perform action: CXAnswerCallAction) {
-        // Prime the audio category early; let CallKit activate the session.
-        try? AVAudioSession.sharedInstance().setCategory(
-            .playAndRecord, mode: .videoChat,
-            options: [.defaultToSpeaker, .allowBluetooth, .allowBluetoothA2DP]
-        )
+        // CallKit owns the audio session from here. The SDK primes the session
+        // category itself — do NOT call AVAudioSession.setCategory.
+        DoorbellSDKClient.shared.setCallKitSessionOwnership(owned: true)
         action.fulfill()
         didAccept = true
 
-        DoorbellSDKClient.shared.acceptCall()     // ← Phase 2: release the offer, go live
+        // Release the pre-armed offer → media goes live.
+        DoorbellSDKClient.shared.acceptCall()
 
         // Present your call UI and embed the SDK's render container.
         presentCallScreen(embedding: videoContainer)
     }
 
-    // ── User declined / call ended ─────────────────────────────────
+    // ── 3. CallKit audio session hooks ───────────────────────────────
+    func provider(_ provider: CXProvider, didActivate audioSession: AVAudioSession) {
+        // Safe even if signaling hasn't finished — the SDK defers internally.
+        DoorbellSDKClient.shared.startAudio()
+    }
+
+    func provider(_ provider: CXProvider, didDeactivate audioSession: AVAudioSession) {
+        DoorbellSDKClient.shared.stopAudio()
+    }
+
+    // ── 4. Decline / end ─────────────────────────────────────────────
     func provider(_ provider: CXProvider, perform action: CXEndCallAction) {
         action.fulfill()
         currentCallID = nil
 
-        // If it was NEVER accepted, tear down the connection we pre-warmed while
-        // ringing. If it WAS accepted, your call screen owns teardown — don't
-        // disconnect here or you'll kill the live stream.
+        // Never accepted → tear down the pre-warmed connection here.
+        // Accepted → your call screen owns teardown (disconnect() on dismiss);
+        // disconnecting here would kill the live stream.
         if !didAccept {
+            DoorbellSDKClient.shared.setCallKitSessionOwnership(owned: false)
             DoorbellSDKClient.shared.declineCall()
         }
         didAccept = false
     }
 
-    // ── CallKit audio session ──────────────────────────────────────
-    // Let CallKit own activation; just tell the SDK when to start/stop audio.
-    func provider(_ provider: CXProvider, didActivate audioSession: AVAudioSession) {
-        DoorbellSDKClient.shared.startAudio()
-    }
-    func provider(_ provider: CXProvider, didDeactivate audioSession: AVAudioSession) {
-        DoorbellSDKClient.shared.stopAudio()
-    }
     func providerDidReset(_ provider: CXProvider) {
-        DoorbellSDKClient.shared.disconnect()
+        DoorbellSDKClient.shared.setCallKitSessionOwnership(owned: false)
     }
 }
 ```
 
-### 6.3 — Embedding the container in your call screen
+Embedding the container in your call screen:
 
 ```swift
 func embedVideo(_ container: UIView, into videoView: UIView) {
@@ -398,248 +267,289 @@ func embedVideo(_ container: UIView, into videoView: UIView) {
 }
 ```
 
-> **Auto Layout gotcha:** the render container must have a non-zero width by the
-> time video attaches. If it is zero, the SDK logs a warning
-> (`video container width is 0; check Auto Layout`) and nothing renders. Give the
-> container real constraints.
-
----
-
-## 7. Audio controls (Talk / Listen)
-
-Both default **off** — the user explicitly enables them.
+And in the call screen itself:
 
 ```swift
-DoorbellSDKClient.shared.setListen(enabled: true)  // hear the doorbell (speaker)
-DoorbellSDKClient.shared.setTalk(enabled: true)    // send mic audio (push-to-talk)
+final class CallScreenVC: UIViewController {
+
+    @IBOutlet private weak var videoView: UIView!
+
+    override func viewDidLoad() {
+        super.viewDidLoad()
+        embedVideo(CallController.shared.videoContainer, into: videoView)
+        CallController.shared.onStreamEvent = { [weak self] event in
+            switch event {
+            case .firstFrameReceived:              self?.hideLoadingSpinner()
+            case .listenStateChanged(let enabled): self?.updateListenButton(enabled)
+            case .talkStateChanged(let enabled):   self?.updateTalkButton(enabled)
+            case .streamStopped:                   self?.showCallEndedUI()
+            case .error(let e):                    self?.showError(e.message)
+            default: break
+            }
+        }
+    }
+
+    @IBAction private func talkTapped(_ sender: UIButton) {
+        DoorbellSDKClient.shared.setTalk(enabled: !sender.isSelected)
+    }
+
+    @IBAction private func listenTapped(_ sender: UIButton) {
+        DoorbellSDKClient.shared.setListen(enabled: !sender.isSelected)
+    }
+
+    @IBAction private func hangUpTapped(_ sender: UIButton) {
+        CallController.shared.onStreamEvent = nil
+        DoorbellSDKClient.shared.disconnect()   // CallKit end + didDeactivate → stopAudio()
+        dismiss(animated: true)
+    }
+}
 ```
-
-Received audio and captured mic audio share **one** audio engine, so Apple's
-voice-processing unit cancels echo automatically — no extra setup, no echo of the
-visitor's voice back to them.
-
-**About `startAudio()` / `stopAudio()`:** these are **for CallKit only**. Call
-them from `didActivate` / `didDeactivate` (as in [§6.2](#62--the-cxproviderdelegate))
-so CallKit owns audio-session activation. Outside CallKit you do **not** need
-them — `setListen` / `setTalk` are enough on their own.
 
 ---
 
-## 9. Teardown
+# Flow B — Direct live view (no call, no CallKit)
+
+For a "View Live" button inside your app, use `connectToStream(...)`. It
+connects and starts media immediately — no accept step, no CallKit, no session
+ownership calls. `setListen` / `setTalk` are all the audio API you need.
+
+```swift
+final class LiveViewVC: UIViewController {
+
+    @IBOutlet private weak var videoView: UIView!
+
+    override func viewDidLoad() {
+        super.viewDidLoad()
+
+        fetchDoorbellCredentials { [weak self] credentials in
+            guard let self, let credentials else { return }
+            DoorbellSDKClient.shared.connectToStream(
+                credentials: credentials,
+                renderIn: self.videoView
+            ) { [weak self] event in
+                switch event {
+                case .streamStarted:
+                    // Optional: hear the doorbell without an extra tap.
+                    DoorbellSDKClient.shared.setListen(enabled: true)
+                case .firstFrameReceived:
+                    self?.hideLoadingSpinner()
+                case .streamStopped:
+                    self?.showReconnectUI()
+                case .error(let e):
+                    self?.showError(e.message)
+                default: break
+                }
+            }
+        }
+    }
+
+    @IBAction private func talkTapped(_ sender: UIButton) {
+        DoorbellSDKClient.shared.setTalk(enabled: !sender.isSelected)
+    }
+
+    @IBAction private func listenTapped(_ sender: UIButton) {
+        DoorbellSDKClient.shared.setListen(enabled: !sender.isSelected)
+    }
+
+    override func viewWillDisappear(_ animated: Bool) {
+        super.viewWillDisappear(animated)
+        DoorbellSDKClient.shared.disconnect()
+    }
+}
+```
+
+Notes for this flow:
+
+- **Do not** call `startAudio()` / `stopAudio()` / `setCallKitSessionOwnership`
+  — those are CallKit hooks only. The SDK manages the audio session itself here.
+- You can also drive this flow with the two-phase API — call
+  `prepareConnection(...)` then `acceptCall()` — useful if you want the SDK to
+  warm up while your screen is still laying out.
+- Call `disconnect()` when the screen goes away. Connecting again while
+  connected is safe (`connectToStream` tears the old session down first).
+
+---
+
+# Audio behavior
+
+```swift
+DoorbellSDKClient.shared.setListen(enabled: true)  // hear the doorbell
+DoorbellSDKClient.shared.setTalk(enabled: true)    // send mic audio
+```
+
+- Both default **off** on every new connection; enable them explicitly (for
+  calls we recommend enabling Listen on `.streamStarted`, as shown above).
+- Each call emits `.listenStateChanged` / `.talkStateChanged` so your buttons
+  can bind to events rather than local state.
+- **Loudspeaker routing is automatic.** While Listen is on, incoming audio
+  plays through the phone's loud (bottom) speaker — in both flows — and moves
+  to headphones / Bluetooth automatically when connected. You never call
+  `overrideOutputAudioPort` or touch `AVAudioSession`.
+- **Echo cancellation is automatic.** Received audio and mic capture share one
+  voice-processed audio engine, so the doorbell never hears its own audio back.
+  Full-duplex (Talk + Listen together) works without feedback.
+- **Mic indicator during Listen.** While Listen is enabled the orange
+  microphone indicator may be visible even with Talk off. The capture path runs
+  **hardware-muted** for echo cancellation and loudspeaker routing — **no audio
+  leaves the device until Talk is enabled**. This matches how system video-call
+  apps behave.
+- Talk is independent of Listen — use it as push-to-talk
+  (`setTalk(enabled: true)` on press, `false` on release) or as a toggle.
+
+---
+
+# Snapshot, recording, fullscreen
+
+```swift
+// Still image of the current frame (requires an active stream).
+DoorbellSDKClient.shared.captureSnapshot { image in
+    guard let image else { return }
+    // save / display
+}
+
+// Record the incoming stream to a local .mp4.
+DoorbellSDKClient.shared.startRecording(fileName: "visitor.mp4")
+DoorbellSDKClient.shared.stopRecording { url in
+    guard let url else { return }   // nil on failure
+    // move / share the file
+}
+```
+
+For a fullscreen presentation, re-parent the SDK's live renderer view instead
+of reconnecting:
+
+```swift
+if let renderer = DoorbellSDKClient.shared.remoteVideoView {
+    embedVideo(renderer, into: fullscreenContainer)   // same helper as above
+}
+```
+
+---
+
+# Teardown
 
 ```swift
 DoorbellSDKClient.shared.disconnect()   // stop stream, release everything
 ```
 
-`disconnect()` closes the signaling socket, tears down the peer connection,
-stops any recording, and releases the renderer. `declineCall()` is an **alias**
-for `disconnect()` that simply reads better at a call site. (SSL stays
-initialized for the process — that is intentional, so the next connect is fast.)
+`declineCall()` is an alias for `disconnect()` that reads better at a call
+site. After `disconnect()` the client is reusable — the next
+`connectToStream` / `prepareConnection` starts a fresh session.
 
 ---
 
-## 10. Credentials
-
-You supply your own AWS credentials — **no vendor credentials are baked into the
-SDK**. Fetch temporary STS/Cognito credentials from your backend and pass them in:
+# Credentials
 
 ```swift
 let credentials = DoorbellCredentials.aws(
     accessKey:    "AKIA...",
     secretKey:    "...",
-    sessionToken: "...",   // temporary STS/Cognito token; pass "" for permanent creds
+    sessionToken: "...",   // temporary STS/Cognito token; "" for permanent creds
     channelARN:   "arn:aws:kinesisvideo:us-east-1:123456789012:channel/my-doorbell/1700000000000",
     region:       "us-east-1"   // must match the CHANNEL's region
 )
 ```
 
-> **`region` must be the KVS *channel's* region**, which can differ from the
+> `region` must be the KVS **channel's** region, which may differ from the
 > region your IAM credentials were issued in.
 
-**Security recommendation:** issue **short-lived, least-privilege** credentials
-scoped to the one channel (via Cognito or an STS `AssumeRole`). Never ship
-long-lived IAM keys inside the app.
-
-Two other credential cases exist on the enum:
-
-- **`.custom(serverURL:headers:)`** — connect to a generic WebSocket signaling
-  server instead of KVS.
-- **`.azure(connectionString:region:)`** — reserved for future support (not yet
-  implemented; using it returns an `unsupportedCloudProvider` error).
+A `.custom(serverURL:headers:)` case is available for a generic WebSocket
+signaling server. `.azure` is reserved for future support.
 
 ---
 
-## 11. Events & errors
+# Events (`DoorbellEvent`)
 
-All events are delivered on the **main thread** via your `onEvent` closure, so
-you can update UI directly inside it.
-
-### `DoorbellEvent`
+Delivered on the **main thread** via the `onEvent` closure you pass to
+`connectToStream` / `prepareConnection`.
 
 | Event | Meaning |
 | --- | --- |
 | `.connected` | Signaling WebSocket connected. |
-| `.prepared` | **Two-phase only:** warm-up complete, offer pre-armed & held. Call `acceptCall()` or `declineCall()`. |
-| `.streamStarted` | WebRTC peer connected (SDP + ICE complete). |
-| `.firstFrameReceived` | First video frame decoded & rendered — hide your spinner here. |
+| `.prepared` | Two-phase only: warm-up complete, offer held. Call `acceptCall()` or `declineCall()`. |
+| `.streamStarted` | WebRTC peer connected (SDP + ICE done). Good moment to enable Listen. |
+| `.firstFrameReceived` | First video frame decoded & rendered. Hide your spinner. |
 | `.streamStopped` | Stream ended (cleanly or by remote). |
-| `.talkStateChanged(isEnabled:)` | Mic (Talk) state changed. |
-| `.listenStateChanged(isEnabled:)` | Speaker (Listen) state changed. |
-| `.snapshotCaptured(UIImage)` | A snapshot is ready. |
+| `.talkStateChanged(isEnabled:)` | Talk (mic) state changed. |
+| `.listenStateChanged(isEnabled:)` | Listen (speaker) state changed. |
+| `.snapshotCaptured(UIImage)` | Snapshot ready. |
 | `.recordingStarted` | Recording began. |
-| `.recordingSaved(URL)` | Recording written to this file URL. |
+| `.recordingSaved(URL)` | Recording written to this file. |
 | `.recordingSaveFailed` | Recording could not be saved. |
-| `.error(DoorbellError)` | Something failed — read `error.message`. |
+| `.error(DoorbellError)` | See `error.message`. |
 
-### `DoorbellError`
+### Errors (`DoorbellError`)
 
-Every case exposes a human-readable `.message`. Categories:
+Every case exposes a human-readable `.message`. Categories: invalid credentials
+(`.invalidCredentials`, `.missingChannelARN`), connection setup
+(`.failedToGetEndpoints`, `.failedToSignURL`, `.failedToGetICEServers`,
+`.signalingConnectionFailed`), WebRTC negotiation (`.webRTCOfferFailed`,
+`.webRTCAnswerFailed`, `.webRTCConnectionFailed`), and feature guards
+(`.notConnected`, `.streamNotActive`).
 
-| Category | Cases |
-| --- | --- |
-| Credentials / config | `.invalidCredentials`, `.missingChannelARN` |
-| Cloud / network | `.failedToGetEndpoints`, `.failedToSignURL`, `.failedToGetICEServers`, `.signalingConnectionFailed` |
-| WebRTC | `.webRTCOfferFailed`, `.webRTCAnswerFailed`, `.webRTCConnectionFailed` |
-| Feature guards | `.notConnected`, `.streamNotActive` |
-| Provider | `.unsupportedCloudProvider` |
-| Generic | `.unknown` |
+---
+
+# State flags
 
 ```swift
-case .error(let e):
-    print(e.message)   // e.g. "Invalid credentials: Missing AWS credentials or channelARN"
+DoorbellSDKClient.shared.isConnected   // signaling connected
+DoorbellSDKClient.shared.isStreaming   // media flowing
+DoorbellSDKClient.shared.isPrepared    // warmed up, awaiting accept/decline
+DoorbellSDKClient.version              // SDK version string
 ```
 
 ---
 
-## 12. State flags
+# API summary
 
-Read-only properties you can poll at any time:
-
-```swift
-DoorbellSDKClient.shared.isConnected    // signaling WebSocket connected
-DoorbellSDKClient.shared.isStreaming    // media is flowing
-DoorbellSDKClient.shared.isPrepared     // warmed up, awaiting accept / decline
-DoorbellSDKClient.shared.remoteVideoView // the SDK's live video view (for fullscreen handoff)
-DoorbellSDKClient.version               // "1.0.2"
-```
-
----
-
-## 13. How a connection is built (internals)
-
-You do not need this to integrate, but it helps when reading the SDK's console
-logs (every step is time-stamped and tagged `[DoorbellSDK] [+NNNms]`). The AWS
-viewer path runs these steps:
-
-| Step | What happens |
-| --- | --- |
-| **1** | `GetSignalingChannelEndpoint` → WSS + HTTPS endpoints *(reused from cache on reconnect)* |
-| **2** | Fetch ICE/TURN servers **and** sign the WSS URL — **in parallel** |
-| **3** | Create the peer connection **with** the fetched ICE servers (so TURN relay candidates are generated) |
-| **4** | **Pre-arm** the SDP offer → local ICE gathering begins now |
-| **5** | Connect the signaling WebSocket |
-| **6** | On accept: send the pre-armed offer to the doorbell |
-| **7** | Receive the SDP answer → `setRemoteDescription` |
-| **8** | ICE candidate exchange (continual gathering, prioritized delivery) |
-| **9** | ICE `connected`/`completed` → **`.streamStarted`** |
-| **10** | First H.265 frame decoded & rendered → **`.firstFrameReceived`** |
-
-In two-phase mode, steps 1–5 all happen during `prepareConnection()` (while the
-phone rings) and the flow pauses at the pre-armed offer until `acceptCall()`
-triggers step 6.
+| Method | Purpose | Flow |
+| --- | --- | --- |
+| `prewarm()` *(static)* | Pre-init WebRTC at app launch. | Both |
+| `prepareConnection(credentials:renderIn:isMaster:clientId:onEvent:)` | Phase 1 — warm up, hold the offer. | A |
+| `acceptCall()` | Phase 2 — release the offer, go live. Safe at any time. | A |
+| `declineCall()` | Phase 2 — tear down (alias of `disconnect`). | A |
+| `setCallKitSessionOwnership(owned:)` | CallKit owns the audio session (answer) / released (decline, reset). Primes the session category for you. | A |
+| `startAudio()` / `stopAudio()` | Forward CallKit `didActivate` / `didDeactivate`. | A |
+| `connectToStream(credentials:renderIn:isMaster:clientId:onEvent:)` | One-shot connect, media starts immediately. | B |
+| `setListen(enabled:)` | Hear the doorbell (loudspeaker, automatic routing). | Both |
+| `setTalk(enabled:)` | Send mic audio (push-to-talk or toggle). | Both |
+| `captureSnapshot(completion:)` | Still image of the current frame. | Both |
+| `startRecording(fileName:)` / `stopRecording(completion:)` | Record incoming stream to .mp4. | Both |
+| `remoteVideoView` | The SDK's live renderer view, for fullscreen re-parenting. | Both |
+| `disconnect()` | Stop & release everything. | Both |
+| `isConnected` / `isStreaming` / `isPrepared` | State flags. | Both |
 
 ---
 
-## 14. Resilience — how the SDK survives a flaky network
+# Do / Don't
 
-The SDK is deliberately forgiving of the doorbell's IoT-grade networking:
+**Do**
 
-- **ICE-failure grace period (5 s).** When ICE reports `failed`/`disconnected`,
-  the SDK does **not** tear down immediately — doorbells frequently trickle their
-  winning relay/host candidate late, and libwebrtc can recover the pair once it
-  arrives. Teardown only fires if the connection has not recovered after 5 s.
-- **Frame watchdog (5 s).** After the first frame, if decoded frames stop
-  arriving for 5 s the stream is declared dead and you get `.streamStopped`, so a
-  silently frozen picture doesn't linger.
-- **Self-healing endpoint cache.** A stale cached endpoint (channel recreated)
-  is detected on the next failure and dropped automatically, so the following
-  connect re-fetches cleanly.
-- **Duplicate-disconnect guard.** Multiple failure paths (socket close + ICE
-  failure) can't fire `.streamStopped` twice.
+- Call `prewarm()` once at launch.
+- Pre-warm (`prepareConnection`) the moment a call is signalled; accept with
+  `acceptCall()` when answered.
+- Enable Listen on `.streamStarted` for calls so the visitor is heard
+  immediately.
+- Request microphone permission before the first Talk/Listen use.
+- Call `disconnect()` (or `declineCall()`) on every exit path.
 
-None of this needs configuration — it is on by default.
+**Don't**
 
----
-
-## 15. Full API reference
-
-All calls go through the shared singleton `DoorbellSDKClient.shared` (except the
-static `prewarm()` and `version`).
-
-| Member | Purpose |
-| --- | --- |
-| `static func prewarm()` | Pre-init WebRTC SSL + factory at launch. Saves ~150 ms on first connect. |
-| `static let version: String` | SDK version string (`"1.0.2"`). |
-| `prepareConnection(credentials:renderIn:isMaster:clientId:onEvent:)` | **Phase 1** — warm up the whole connection, hold the offer. |
-| `acceptCall()` | **Phase 2** — release the held offer, go live. Safe to call before `.prepared`. |
-| `declineCall()` | **Phase 2** — tear everything down (alias for `disconnect()`). |
-| `connectToStream(credentials:renderIn:isMaster:clientId:onEvent:)` | One-shot connect (no accept step) — starts media immediately. |
-| `setListen(enabled:)` | Enable/disable hearing the doorbell (speaker). |
-| `setTalk(enabled:)` | Enable/disable sending mic audio (push-to-talk). |
-| `startAudio()` / `stopAudio()` | **CallKit only** — audio-session activation hooks. |
-| `captureSnapshot(completion:)` | Grab the current frame as a `UIImage`. |
-| `startRecording(fileName:)` | Begin recording the incoming stream to `.mp4`. |
-| `stopRecording(completion:)` | Stop recording; returns the saved file `URL` (or `nil`). |
-| `disconnect()` | Stop the stream and release all resources. |
-| `isConnected` / `isStreaming` / `isPrepared` | Read-only state flags. |
-| `remoteVideoView` | The SDK's live video `UIView`, for fullscreen handoff. |
-
-**Optional parameters on the two connect methods:**
-
-- `isMaster: Bool = false` — leave `false`. `false` = viewer (your app *receives*
-  the stream), which is the doorbell use case. `true` = master, rarely needed on
-  mobile.
-- `clientId: String? = nil` — a custom client id. A UUID is auto-generated if
-  you pass `nil`.
+- Don't call `AVAudioSession.setCategory` / `setActive` /
+  `overrideOutputAudioPort` anywhere in either flow — the SDK owns the audio
+  session end to end. (In the CallKit flow, `setCallKitSessionOwnership(owned:
+  true)` primes the session for you.)
+- Don't call `startAudio()` / `stopAudio()` / `setCallKitSessionOwnership`
+  outside the CallKit flow.
+- Don't play SDK audio through your own player, and don't run another
+  `AVAudioEngine` / player during a stream — it will break echo cancellation.
+- Don't leave a pre-warmed connection hanging — decline on ring timeout.
+- Don't re-register the SDK event handler mid-call; relay events to your UI
+  through your own closure (see `onStreamEvent` in the example).
 
 ---
 
-## 16. Threading rules
+# Threading
 
-- **Call the SDK from the main thread.**
-- **All events arrive on the main thread**, so you can touch UIKit directly
-  inside the `onEvent` closure — no dispatching back to main needed.
-
----
-
-## 17. Integration checklist & troubleshooting
-
-**Checklist**
-
-- [ ] Added the **DoorbellSDK** package to your app target (LiveKitWebRTC
-      resolves automatically).
-- [ ] Called `DoorbellSDKClient.prewarm()` in `didFinishLaunchingWithOptions`.
-- [ ] Added `NSMicrophoneUsageDescription` and `NSLocalNetworkUsageDescription`
-      to Info.plist (and `UIBackgroundModes` if using CallKit in background).
-- [ ] Fetch **short-lived** AWS credentials from your backend; `region` matches
-      the **channel's** region.
-- [ ] Render into a container view that has **non-zero** Auto Layout constraints.
-- [ ] For calls: `prepareConnection()` on ring, `acceptCall()` on answer,
-      `declineCall()` on decline/timeout.
-
-**Troubleshooting**
-
-| Symptom | Likely cause / fix |
-| --- | --- |
-| Black screen, no `.firstFrameReceived` | Render container has zero width (check Auto Layout); or H.265 unsupported on the device (check the codec-capability log from `prewarm()`). |
-| `.error` with "Invalid credentials" / "Missing AWS credentials" | Empty `accessKey`/`secretKey`/`channelARN`, or `region` doesn't match the channel. |
-| `.error` fetching endpoints / signing URL | Credentials lack KVS permissions for the channel, or the session token expired. |
-| Connect feels slow every time | You aren't reusing the process — make sure `prewarm()` runs at launch and you connect to the **same** channel within the cache window to benefit from the endpoint cache. |
-| No audio from the doorbell | Call `setListen(enabled: true)`; under CallKit make sure `startAudio()` is wired to `didActivate`. |
-| Talk doesn't work | Missing `NSMicrophoneUsageDescription`, or `setTalk(enabled:)` not called. |
-| Stream drops on a brief blip | Expected to *recover* — the SDK holds a 5 s grace period. Only a genuine >5 s outage fires `.streamStopped`. |
-
----
-
-*DoorbellSDK v1.0.2 — AWS KVS WebRTC · H.265 · two-way audio. Questions on
-integration? Contact your SDK provider.*
+Call the SDK from the **main thread**. All events are delivered on the main
+thread, so you can update UI directly inside the `onEvent` closure.
